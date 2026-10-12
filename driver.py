@@ -8,6 +8,7 @@ import ast
 import concurrent.futures
 import copy
 import datetime as dt
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -61,6 +62,7 @@ TASK_FIELDS = {
     "replans",
 }
 STATE_FIELDS = {"status", "attempts", "history", "approval", "replans"}
+OPTIONAL_TASK_FIELDS = {"protected"}
 PRINT_LOCK = threading.Lock()
 
 
@@ -89,6 +91,11 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
             raise DriverError(f"[{role}].command must be a non-empty string array")
         if not isinstance(config[role].get("model"), str):
             raise DriverError(f"[{role}].model must be a string")
+    protected = config["driver"].get("protected", ["tests/**"])
+    if not isinstance(protected, list) or not all(
+        isinstance(pattern, str) and pattern.strip() for pattern in protected
+    ):
+        raise DriverError("[driver].protected must be a list of non-empty patterns")
     return config
 
 
@@ -178,9 +185,17 @@ def validate_plan(plan: Any) -> None:
     ids: set[str] = set()
     for index, task in enumerate(plan["tasks"]):
         where = f"task #{index + 1}"
-        if not isinstance(task, dict) or set(task) != TASK_FIELDS:
+        if (
+            not isinstance(task, dict)
+            or not TASK_FIELDS <= set(task)
+            or set(task) - TASK_FIELDS - OPTIONAL_TASK_FIELDS
+        ):
             missing = TASK_FIELDS - set(task) if isinstance(task, dict) else TASK_FIELDS
-            extra = set(task) - TASK_FIELDS if isinstance(task, dict) else set()
+            extra = (
+                set(task) - TASK_FIELDS - OPTIONAL_TASK_FIELDS
+                if isinstance(task, dict)
+                else set()
+            )
             raise DriverError(
                 f"{where} fields are invalid (missing={sorted(missing)}, extra={sorted(extra)})"
             )
@@ -206,6 +221,14 @@ def validate_plan(plan: Any) -> None:
             isinstance(item, str) and item.strip() for item in task["scope"]
         ):
             raise DriverError(f"{task_id}.scope must contain at least one path or glob")
+        if "protected" in task and (
+            not isinstance(task["protected"], list)
+            or not all(
+                isinstance(pattern, str) and pattern.strip()
+                for pattern in task["protected"]
+            )
+        ):
+            raise DriverError(f"{task_id}.protected must be a list of non-empty patterns")
         if not task["checks"] or not all(
             isinstance(item, str) and item.strip() for item in task["checks"]
         ):
@@ -315,6 +338,7 @@ def render_plan(plan: dict[str, Any]) -> None:
                 f"- **Lane:** {task['lane']}",
                 f"- **Goal:** {task['goal']}",
                 f"- **Scope:** {', '.join(f'`{item}`' for item in task['scope'])}",
+                f"- **Protected:** {', '.join(task.get('protected', [])) or 'driver defaults only'}",
                 f"- **Depends on:** {', '.join(task['depends_on']) or 'none'}",
                 "- **Checks:**",
             ]
@@ -468,20 +492,39 @@ def visible_files(git_executable: str, checkout: Path) -> list[str]:
 
 
 def capture_checkout(git_executable: str, checkout: Path) -> dict[str, Any]:
-    files = {
-        path: (checkout / Path(path)).read_bytes()
-        for path in visible_files(git_executable, checkout)
-        if (checkout / Path(path)).is_file()
-    }
-    return {
-        "checkout": checkout,
-        "head": git(git_executable, ["rev-parse", "HEAD"], checkout).stdout.strip(),
-        "branch": git(
-            git_executable, ["branch", "--show-current"], checkout
-        ).stdout.strip(),
-        "index": git(git_executable, ["write-tree"], checkout).stdout.strip(),
-        "files": files,
-    }
+    backup = tempfile.TemporaryDirectory(prefix="driver-checkout-")
+    try:
+        files: dict[str, tuple[int, int]] = {}
+        for path in visible_files(git_executable, checkout):
+            source = checkout / Path(path)
+            if source.is_file():
+                stat = source.stat()
+                files[path] = (stat.st_size, stat.st_mtime_ns)
+                target = Path(backup.name) / Path(path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+        return {
+            "checkout": checkout,
+            "head": git(git_executable, ["rev-parse", "HEAD"], checkout).stdout.strip(),
+            "branch": git(
+                git_executable, ["branch", "--show-current"], checkout
+            ).stdout.strip(),
+            "index": git(git_executable, ["write-tree"], checkout).stdout.strip(),
+            "status": git(git_executable, ["status", "--porcelain=v1", "-z"], checkout).stdout,
+            "files": files,
+            "backup": backup,
+        }
+    except BaseException:
+        backup.cleanup()
+        raise
+
+
+def file_digest(path: Path) -> bytes:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
 
 
 def checkout_changes(
@@ -491,13 +534,31 @@ def checkout_changes(
     current_paths = set(visible_files(git_executable, checkout))
     old_paths = set(snapshot["files"])
     changes = current_paths ^ old_paths
+    status = git(
+        git_executable, ["status", "--porcelain=v1", "-z"], checkout
+    ).stdout
+    index = git(git_executable, ["write-tree"], checkout).stdout.strip()
+    git_metadata_changed = status != snapshot["status"] or index != snapshot["index"]
+    status_paths: set[str] = set()
+    if git_metadata_changed:
+        # Include both source and destination of porcelain rename/copy records.
+        for record in (status + snapshot["status"]).split("\0"):
+            if record:
+                status_paths.add(record[3:] if len(record) > 2 and record[2] == " " else record)
     for path in current_paths & old_paths:
         current = checkout / Path(path)
-        if not current.is_file() or current.read_bytes() != snapshot["files"][path]:
+        if not current.is_file():
             changes.add(path)
+            continue
+        stat = current.stat()
+        metadata = (stat.st_size, stat.st_mtime_ns)
+        if metadata != snapshot["files"][path] or path in status_paths:
+            original = Path(snapshot["backup"].name) / Path(path)
+            if file_digest(current) != file_digest(original):
+                changes.add(path)
     if git(git_executable, ["rev-parse", "HEAD"], checkout).stdout.strip() != snapshot["head"]:
         changes.add("<HEAD>")
-    if git(git_executable, ["write-tree"], checkout).stdout.strip() != snapshot["index"]:
+    if index != snapshot["index"]:
         changes.add("<INDEX>")
     branch = git(git_executable, ["branch", "--show-current"], checkout).stdout.strip()
     if branch != snapshot["branch"]:
@@ -505,7 +566,9 @@ def checkout_changes(
     return sorted(changes)
 
 
-def restore_checkout(git_executable: str, snapshot: dict[str, Any]) -> None:
+def restore_checkout(
+    git_executable: str, snapshot: dict[str, Any], changes: list[str]
+) -> None:
     checkout = snapshot["checkout"]
     current_paths = set(visible_files(git_executable, checkout))
     old_paths = set(snapshot["files"])
@@ -513,10 +576,10 @@ def restore_checkout(git_executable: str, snapshot: dict[str, Any]) -> None:
         candidate = checkout / Path(path)
         if candidate.is_file() or candidate.is_symlink():
             candidate.unlink()
-    for path, payload in snapshot["files"].items():
+    for path in old_paths & set(changes):
         target = checkout / Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(payload)
+        shutil.copy2(Path(snapshot["backup"].name) / Path(path), target)
     if snapshot["branch"]:
         git(
             git_executable,
@@ -536,13 +599,16 @@ def verify_and_restore_checkout(
     snapshot: dict[str, Any],
     allowed: set[str] | None = None,
 ) -> list[str]:
-    changes = checkout_changes(git_executable, snapshot)
-    unauthorized = [
-        path for path in changes if allowed is None or path not in allowed
-    ]
-    if changes:
-        restore_checkout(git_executable, snapshot)
-    return unauthorized
+    try:
+        changes = checkout_changes(git_executable, snapshot)
+        unauthorized = [
+            path for path in changes if allowed is None or path not in allowed
+        ]
+        if changes:
+            restore_checkout(git_executable, snapshot, changes)
+        return unauthorized
+    finally:
+        snapshot["backup"].cleanup()
 
 
 def configured_worktree_root(config: dict[str, Any]) -> Path:
@@ -687,8 +753,8 @@ def reconcile_replan(
         new = new_by_id.get(task_id)
         if new is None:
             raise DriverError(f"planner removed non-replan task {task_id}")
-        for field in TASK_FIELDS - STATE_FIELDS:
-            if new[field] != old[field]:
+        for field in (TASK_FIELDS | OPTIONAL_TASK_FIELDS) - STATE_FIELDS:
+            if new.get(field) != old.get(field):
                 raise DriverError(f"planner changed non-replan task {task_id}.{field}")
         for field in STATE_FIELDS:
             new[field] = copy.deepcopy(old[field])
@@ -697,7 +763,8 @@ def reconcile_replan(
         old = old_by_id.get(task["id"])
         if old and task["id"] in replanning:
             changed = any(
-                task[field] != old[field] for field in TASK_FIELDS - STATE_FIELDS
+                task.get(field) != old.get(field)
+                for field in (TASK_FIELDS | OPTIONAL_TASK_FIELDS) - STATE_FIELDS
             )
             if changed:
                 task["status"] = "todo"
@@ -708,7 +775,7 @@ def reconcile_replan(
                         "at": dt.datetime.now(dt.timezone.utc).isoformat(),
                     }
                 ]
-                task["approval"] = copy.deepcopy(old["approval"])
+                task["approval"] = None
                 task["replans"] = old["replans"]
             else:
                 for field in STATE_FIELDS:
@@ -792,6 +859,11 @@ def path_in_scope(path: str, patterns: list[str]) -> bool:
         pattern = raw.replace("\\", "/")
         while pattern.startswith("./"):
             pattern = pattern[2:]
+        if pattern.endswith("/**") and not any(
+            character in pattern[:-3] for character in "*?["
+        ):
+            if normalized.startswith(pattern[:-2]):
+                return True
         if PurePosixPath(normalized).match(pattern):
             return True
         if not any(character in pattern for character in "*?["):
@@ -811,18 +883,15 @@ def path_explicitly_in_scope(path: str, patterns: list[str]) -> bool:
 
 
 def protected_check_changes(
-    changed: list[str], task: dict[str, Any]
+    changed: list[str], task: dict[str, Any], config: dict[str, Any]
 ) -> list[str]:
-    protected: list[str] = []
-    for path in changed:
-        slash_path = path.replace("\\", "/")
-        mentioned = any(
-            slash_path in command or Path(slash_path).name in command
-            for command in task["checks"]
-        )
-        if mentioned and not path_explicitly_in_scope(path, task["scope"]):
-            protected.append(path)
-    return protected
+    patterns = config["driver"].get("protected", ["tests/**"]) + task.get("protected", [])
+    return [
+        path
+        for path in changed
+        if path_in_scope(path, patterns)
+        and not path_explicitly_in_scope(path, task["scope"])
+    ]
 
 
 def tail(output: str, count: int = 40) -> str:
@@ -865,7 +934,6 @@ def execute_task(
     worktree: Path,
     base: str,
     run_dir: Path,
-    integration_worktree: Path,
 ) -> dict[str, Any]:
     attempt = task["attempts"] + 1
     timeout = int(config["driver"].get("timeout_seconds", 1200))
@@ -873,27 +941,7 @@ def execute_task(
         config["coder"], coder_prompt(task), "coder", task, attempt
     )
     log_path = run_dir / f"{safe_name(task['id'])}-attempt-{attempt}.log"
-    main_snapshot = capture_checkout(git_executable, ROOT)
-    integration_snapshot = capture_checkout(git_executable, integration_worktree)
     code, output = run_process(command, worktree, timeout, log_path)
-    main_violations = verify_and_restore_checkout(git_executable, main_snapshot)
-    integration_violations = verify_and_restore_checkout(
-        git_executable, integration_snapshot
-    )
-    if main_violations or integration_violations:
-        return {
-            "id": task["id"],
-            "verdict": "red",
-            "fatal": True,
-            "failure": {
-                "event": "state_integrity_failed",
-                "attempt": attempt,
-                "command": command_text(command),
-                "exit_code": 1,
-                "evidence": "\n".join(main_violations + integration_violations),
-                "log": str(log_path.relative_to(ROOT)),
-            },
-        }
     if code:
         return {
             "id": task["id"],
@@ -923,7 +971,7 @@ def execute_task(
                 "log": str(log_path.relative_to(ROOT)),
             },
         }
-    protected = protected_check_changes(changed, task)
+    protected = protected_check_changes(changed, task, config)
     if protected:
         return {
             "id": task["id"],
@@ -1006,7 +1054,7 @@ def merge_task(
 ) -> dict[str, Any] | None:
     completed = git(
         git_executable,
-        ["merge", "--no-ff", "--no-edit", result["branch"]],
+        ["merge", "--no-ff", "--no-commit", result["branch"]],
         integration_worktree,
         check=False,
     )
@@ -1017,45 +1065,28 @@ def merge_task(
             {
                 "event": "merge_conflict",
                 "attempt": result["attempt"],
-                "command": f"git merge --no-ff --no-edit {result['branch']}",
+                "command": f"git merge --no-ff --no-commit {result['branch']}",
                 "exit_code": completed.returncode,
                 "evidence": tail(completed.stdout),
                 "at": dt.datetime.now(dt.timezone.utc).isoformat(),
             }
         )
         return None
-    merge_commit = git(
-        git_executable, ["rev-parse", "HEAD"], integration_worktree
-    ).stdout.strip()
     for check_command in task["checks"]:
         check_code, check_output = run_shell_check(
             check_command, integration_worktree, timeout
         )
         if check_code:
-            reverted = git(
-                git_executable,
-                ["revert", "--no-edit", "-m", "1", merge_commit],
-                integration_worktree,
-                check=False,
-            )
-            if reverted.returncode:
-                git(
-                    git_executable,
-                    ["revert", "--abort"],
-                    integration_worktree,
-                    check=False,
-                )
-                raise DriverError(
-                    f"failed to revert merge {merge_commit}: {reverted.stdout}"
-                )
+            git(git_executable, ["merge", "--abort"], integration_worktree)
             return {
                 "event": "integration_check_failed",
                 "attempt": result["attempt"],
                 "command": check_command,
                 "exit_code": check_code,
                 "evidence": tail(check_output),
-                "merge": merge_commit,
+                "branch": result["branch"],
             }
+    git(git_executable, ["commit", "--no-edit"], integration_worktree)
     task["status"] = "done"
     return None
 
@@ -1119,8 +1150,13 @@ def dry_run(plan: dict[str, Any], config: dict[str, Any], max_parallel: int) -> 
                 print(f"[{worktree}]$ {check_command}")
             if task["lane"] == "contained":
                 print_command(
-                    ["git", "merge", "--no-ff", "--no-edit", branch],
+                    ["git", "merge", "--no-ff", "--no-commit", branch],
                     worktree_root / "integration",
+                )
+                for check_command in task["checks"]:
+                    print(f"[{worktree_root / 'integration'}]$ {check_command}")
+                print_command(
+                    ["git", "commit", "--no-edit"], worktree_root / "integration"
                 )
                 task["status"] = "done"
             else:
@@ -1234,33 +1270,57 @@ def run_command(args: argparse.Namespace) -> None:
 
         if not runnable:
             continue
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max_parallel
-        ) as executor:
-            futures = [
-                executor.submit(
-                    execute_task,
-                    task,
-                    config,
-                    git_executable,
-                    worktree,
-                    base,
-                    run_dir,
-                    integration_worktree,
+        main_snapshot = capture_checkout(git_executable, ROOT)
+        integration_snapshot = capture_checkout(git_executable, integration_worktree)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max_parallel
+            ) as executor:
+                futures = [
+                    executor.submit(
+                        execute_task,
+                        task,
+                        config,
+                        git_executable,
+                        worktree,
+                        base,
+                        run_dir,
+                    )
+                    for task, worktree, base in runnable
+                ]
+                results = [future.result() for future in futures]
+        finally:
+            try:
+                main_violations = verify_and_restore_checkout(git_executable, main_snapshot)
+            finally:
+                integration_violations = verify_and_restore_checkout(
+                    git_executable, integration_snapshot
                 )
-                for task, worktree, base in runnable
-            ]
-            results = [future.result() for future in futures]
 
         by_id = task_map(plan)
-        fatal_integrity_failure = False
+        violations = main_violations + integration_violations
+        if violations:
+            # A parallel batch cannot reliably attribute shared-checkout mutations.
+            # Reject the entire batch before any merge or success transition.
+            for result in results:
+                task = by_id[result["id"]]
+                apply_failure(
+                    task,
+                    {
+                        "event": "state_integrity_failed",
+                        "attempt": task["attempts"] + 1,
+                        "command": "batch checkout integrity check",
+                        "exit_code": 1,
+                        "evidence": "\n".join(violations),
+                    },
+                    max_attempts,
+                )
+                write_plan(plan)
+            raise DriverError("agent changed a protected checkout; run stopped")
         for result in results:
             task = by_id[result["id"]]
             if result["verdict"] == "red":
                 apply_failure(task, result["failure"], max_attempts)
-                fatal_integrity_failure = (
-                    fatal_integrity_failure or result.get("fatal", False)
-                )
             elif task["lane"] == "contained":
                 failure = merge_task(
                     task,
@@ -1274,8 +1334,6 @@ def run_command(args: argparse.Namespace) -> None:
             else:
                 task["status"] = "needs_review"
             write_plan(plan)
-        if fatal_integrity_failure:
-            raise DriverError("agent changed a protected checkout; run stopped")
 
     remaining = [
         task["id"]

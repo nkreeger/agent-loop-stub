@@ -48,3 +48,9 @@ Only the driver changes `status`, `attempts`, `history`, `approval`, and
 `replans`. Preserve those fields exactly during replanning. Dependencies must
 name existing task IDs and must not form a cycle. Every task needs non-empty
 `scope` and `checks` lists.
+
+Tasks may also include an optional `protected` list of path/glob patterns.
+These supplement the driver's default protected patterns (`tests/**` by
+default). Editing a protected file requires its exact path in `scope`, not
+just a scope glob or directory. Changing any planner-owned fields during
+replanning revokes a locked task's existing approval.

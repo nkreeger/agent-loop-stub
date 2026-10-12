@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import argparse
+from contextlib import contextmanager
+import copy
 import json
 import os
 from pathlib import Path
@@ -9,8 +12,12 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
+from unittest import mock
+
+import driver
 
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
@@ -100,6 +107,8 @@ class DriverIntegrationTests(unittest.TestCase):
                     not any(character in path for character in "*?[")
                     for path in task["scope"]
                 ) else f"outputs/{task_id}.txt"
+                if "FAKE:target=" in notes:
+                    target = notes.split("FAKE:target=", 1)[1].split()[0]
                 path = Path(target)
                 path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -228,6 +237,24 @@ class DriverIntegrationTests(unittest.TestCase):
         if extra:
             environment.update(extra)
         return environment
+
+    @contextmanager
+    def fake_environment(self):
+        variables = {
+            key: value
+            for key, value in self.environment().items()
+            if key.startswith("FAKE_") or key == "DRIVER_GIT"
+        }
+        original = {key: os.environ.get(key) for key in variables}
+        try:
+            os.environ.update(variables)
+            yield
+        finally:
+            for key, value in original.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
     def run_git(
         self, *args: str, check: bool = True
@@ -391,6 +418,24 @@ class DriverIntegrationTests(unittest.TestCase):
             ),
         )
 
+    def test_compromised_parallel_batch_does_not_merge_other_tasks(self) -> None:
+        self.write_plan([task("A", notes="FAKE:edit-main-plan"), task("B")])
+        self.commit_fixture()
+
+        completed = self.run_driver("run", "--max-parallel", "2", check=False)
+
+        self.assertEqual(2, completed.returncode)
+        for task_id in ("A", "B"):
+            current = self.plan_task(task_id)
+            self.assertEqual("state_integrity_failed", current["history"][0]["event"])
+            self.assertNotEqual(
+                0,
+                self.run_git(
+                    "cat-file", "-e", f"agent-integration:outputs/{task_id}.txt",
+                    check=False,
+                ).returncode,
+            )
+
     def test_interrupted_run_resets_in_progress_and_resumes(self) -> None:
         self.write_plan([task("A", notes="FAKE:sleep-once")])
         self.commit_fixture()
@@ -444,7 +489,7 @@ class DriverIntegrationTests(unittest.TestCase):
         self.assertEqual("fixture\n", (self.root / "README.md").read_text())
         self.assertEqual(before_plan, (self.root / "agents" / "plan.json").read_bytes())
 
-    def test_integration_check_failure_reverts_merge_and_marks_red(self) -> None:
+    def test_integration_check_failure_aborts_merge_and_marks_red(self) -> None:
         python = subprocess.list2cmdline([sys.executable])
         check = (
             f'{python} -c "from pathlib import Path; '
@@ -467,6 +512,157 @@ class DriverIntegrationTests(unittest.TestCase):
             self.run_git(
                 "cat-file", "-e", "agent-integration:outputs/A.txt", check=False
             ).returncode,
+        )
+        history = self.run_git(
+            "log", "--format=%s", "agent-integration"
+        ).stdout
+        self.assertNotIn("Revert", history)
+        self.assertNotIn("Merge", history)
+
+    def test_integration_check_fails_once_then_retry_merges(self) -> None:
+        python = subprocess.list2cmdline([sys.executable])
+        (self.root / "integration_gate.py").write_text(
+            "import os\nfrom pathlib import Path\n"
+            "marker = Path(os.environ['FAKE_FINAL_MARKER'])\n"
+            "if Path.cwd().name == 'integration' and not marker.exists():\n"
+            "    marker.write_text('failed once')\n"
+            "    raise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+        self.write_plan([task("A", checks=[f"{python} integration_gate.py"])])
+        self.commit_fixture()
+
+        self.run_driver("run")
+
+        current = self.plan_task("A")
+        self.assertEqual("done", current["status"])
+        self.assertEqual(1, current["attempts"])
+        self.assertEqual("integration_check_failed", current["history"][0]["event"])
+        self.assertEqual("good-2", self.integration_file("outputs/A.txt"))
+        self.assertEqual(
+            1,
+            len(self.run_git(
+                "log", "--merges", "--format=%H", "agent-integration"
+            ).stdout.splitlines()),
+        )
+
+    def test_replanned_locked_task_loses_approval(self) -> None:
+        approved = task("A", lane="locked", status="replan")
+        approved["approval"] = {"by": "Ada", "at": "2026-01-01T00:00:00Z"}
+        self.write_plan([approved])
+        self.commit_fixture()
+        candidate = self.read_plan()
+        candidate["tasks"][0]["goal"] = "A changed goal requires fresh approval"
+
+        self.run_driver(
+            "run",
+            extra_env={
+                "FAKE_PLANNER_MODE": "write-plan",
+                "FAKE_PLANNER_PLAN": json.dumps(candidate),
+            },
+        )
+
+        current = self.plan_task("A")
+        self.assertIsNone(current["approval"])
+        self.assertEqual("awaiting_approval", current["status"])
+        self.assertNotIn("coder:A", self.invocations.read_text(encoding="utf-8"))
+
+    def test_out_of_scope_change_is_red(self) -> None:
+        self.write_plan([task("A", notes="FAKE:outside")])
+        self.commit_fixture()
+
+        self.run_driver("run")
+
+        current = self.plan_task("A")
+        self.assertEqual("scope_failed", current["history"][0]["event"])
+        self.assertIn("forbidden.txt", current["history"][0]["evidence"])
+        self.assertNotEqual(
+            0,
+            self.run_git(
+                "cat-file", "-e", "agent-integration:forbidden.txt", check=False
+            ).returncode,
+        )
+
+    def test_parallel_batch_snapshots_once_on_main_thread(self) -> None:
+        self.write_plan([task("A"), task("B")])
+        self.commit_fixture()
+        main_thread = threading.get_ident()
+        real_capture = driver.capture_checkout
+        real_verify = driver.verify_and_restore_checkout
+
+        def capture(*args: object) -> dict[str, object]:
+            self.assertEqual(main_thread, threading.get_ident())
+            return real_capture(*args)
+
+        def verify(*args: object) -> list[str]:
+            self.assertEqual(main_thread, threading.get_ident())
+            return real_verify(*args)
+
+        with (
+            mock.patch.multiple(
+                driver,
+                ROOT=self.root,
+                PLAN_PATH=self.root / "agents" / "plan.json",
+                PLAN_VIEW_PATH=self.root / "agents" / "PLAN.md",
+                CODER_PATH=self.root / "agents" / "CODER.md",
+                LESSONS_PATH=self.root / "agents" / "LESSONS.md",
+            ),
+            self.fake_environment(),
+            mock.patch.object(
+                driver, "load_config", return_value=driver.load_config(self.root / "driver.toml")
+            ),
+            mock.patch.object(driver, "load_plan", side_effect=lambda: driver.parse_plan_bytes(
+                (self.root / "agents" / "plan.json").read_bytes(), "fixture"
+            )),
+            mock.patch.object(driver, "capture_checkout", side_effect=capture) as captures,
+            mock.patch.object(driver, "verify_and_restore_checkout", side_effect=verify) as verifications,
+        ):
+            driver.run_command(argparse.Namespace(max_parallel=2, dry_run=False))
+
+        self.assertEqual(2, captures.call_count)
+        self.assertEqual(2, verifications.call_count)
+        self.assertEqual("done", self.plan_task("A")["status"])
+        self.assertEqual("done", self.plan_task("B")["status"])
+
+    def test_snapshot_hashes_only_metadata_candidates_and_restores(self) -> None:
+        self.write_plan([])
+        self.commit_fixture()
+        readme = self.root / "README.md"
+        snapshot = driver.capture_checkout(self.git, self.root)
+        with mock.patch.object(driver, "file_digest", wraps=driver.file_digest) as digests:
+            self.assertEqual([], driver.checkout_changes(self.git, snapshot))
+            self.assertEqual(0, digests.call_count)
+            readme.write_text("changed\n", encoding="utf-8")
+            self.assertEqual(
+                ["README.md"],
+                driver.verify_and_restore_checkout(self.git, snapshot),
+            )
+            self.assertEqual(2, digests.call_count)
+        self.assertEqual("fixture\n", readme.read_text(encoding="utf-8"))
+
+    def test_protected_changes_in_replan_revoke_approval(self) -> None:
+        before = {
+            "goal": "test",
+            "final_checks": [],
+            "tasks": [task("A", lane="locked", status="replan")],
+        }
+        before["tasks"][0]["approval"] = {"by": "Ada", "at": "2026-01-01"}
+        unchanged = driver.reconcile_replan(before, copy.deepcopy(before))
+        self.assertEqual(before["tasks"][0]["approval"], unchanged["tasks"][0]["approval"])
+        candidate = copy.deepcopy(before)
+        candidate["tasks"][0]["protected"] = ["checks/**"]
+
+        reconciled = driver.reconcile_replan(before, candidate)
+
+        self.assertIsNone(reconciled["tasks"][0]["approval"])
+
+    def test_protected_defaults_cover_nested_tests(self) -> None:
+        current = task("A", scope=["tests/**"])
+        self.assertEqual(
+            ["tests/nested/test_gate.py"],
+            driver.protected_check_changes(
+                ["tests/nested/test_gate.py"], current, {"driver": {}}
+            ),
         )
 
     def test_final_checks_run_and_are_reported(self) -> None:
@@ -506,15 +702,72 @@ class DriverIntegrationTests(unittest.TestCase):
         self.assertEqual(2, current["replans"])
         self.assertEqual("replan_limit_reached", current["history"][-1]["event"])
 
-    def test_check_named_file_requires_explicit_scope(self) -> None:
-        self.write_plan([task("A", scope=["outputs/**"])])
+    def test_default_protected_file_requires_explicit_scope(self) -> None:
+        self.write_plan([
+            task("A", scope=["tests/**"], notes="FAKE:target=tests/check.py")
+        ])
         self.commit_fixture()
 
         self.run_driver("run")
 
         current = self.plan_task("A")
         self.assertEqual("check_protection_failed", current["history"][0]["event"])
-        self.assertIn("outputs/A.txt", current["history"][0]["evidence"])
+        self.assertIn("tests/check.py", current["history"][0]["evidence"])
+
+    def test_per_task_protected_patterns_are_optional_and_additive(self) -> None:
+        current = task("A", scope=["outputs/**"])
+        current["protected"] = ["outputs/**"]
+        self.write_plan([current])
+        self.commit_fixture()
+
+        self.run_driver("run")
+
+        self.assertEqual(
+            "check_protection_failed", self.plan_task("A")["history"][0]["event"]
+        )
+        config = {"driver": {"protected": ["checks/**"]}}
+        self.assertEqual(
+            ["checks/gate.py", "outputs/A.txt"],
+            driver.protected_check_changes(
+                ["checks/gate.py", "outputs/A.txt", "tests/test.py"], current, config
+            ),
+        )
+
+    def test_configured_protection_default_is_enforced(self) -> None:
+        config = (self.root / "driver.toml").read_text(encoding="utf-8")
+        config = config.replace(
+            "max_parallel = 2", 'max_parallel = 2\nprotected = ["outputs/**"]'
+        )
+        (self.root / "driver.toml").write_text(config, encoding="utf-8")
+        self.write_plan([task("A", scope=["outputs/**"])])
+        self.commit_fixture()
+
+        self.run_driver("run")
+
+        self.assertEqual(
+            "check_protection_failed", self.plan_task("A")["history"][0]["event"]
+        )
+
+    def test_explicit_scope_allows_protected_file(self) -> None:
+        current = task("A", scope=["tests/check.py"])
+        current["checks"] = [
+            f'{subprocess.list2cmdline([sys.executable])} -c "raise SystemExit(0)"'
+        ]
+        self.write_plan([current])
+        self.commit_fixture()
+
+        self.run_driver("run")
+
+        self.assertEqual("done", self.plan_task("A")["status"])
+        self.assertEqual("good-1", self.integration_file("tests/check.py"))
+
+    def test_check_command_mentions_do_not_imply_protection(self) -> None:
+        self.write_plan([task("A", scope=["outputs/**"])])
+        self.commit_fixture()
+
+        self.run_driver("run")
+
+        self.assertEqual("done", self.plan_task("A")["status"])
 
     def test_dependency_ordering(self) -> None:
         self.write_plan([task("A"), task("B", depends_on=["A"])])

@@ -53,13 +53,23 @@ most `max_replans` planner passes before becoming `blocked`.
 `status`, `attempts`, `history`, `approval`, and `replans`. The driver rejects
 unknown dependencies, cycles, empty checks, and empty scope. Only the driver
 changes state fields; `agents/PLAN.md` is regenerated after every state change.
+An optional per-task `protected` list supplements `[driver].protected`
+(default `["tests/**"]`). Protected files require exact paths in `scope`;
+scope globs or directory entries do not authorize changes to them.
+Replanning that changes any planner-owned task field revokes its approval.
 
 The in-memory plan is authoritative while a command runs. Agent calls are
 wrapped in checkout snapshots: unauthorized main/integration changes are
 restored and rejected, planner calls may change only `agents/plan.json`, and
-coder changes to plan state are RED. Contained merges are checked again on the
-integration worktree and reverted on failure. `final_checks` run after all
-tasks are done.
+coder changes to plan state are RED. Each coder batch shares one pair of
+snapshots taken and verified on the main thread. Snapshots store recovery
+copies on disk, compare Git and file metadata first, and hash only candidate
+files. A batch with unauthorized changes is rejected before any merge.
+
+Contained tasks use `git merge --no-ff --no-commit`, then run their checks on
+the integration worktree. Green checks allow the merge commit; red checks
+abort the merge without changing integration history, so a later retry can
+merge normally. `final_checks` run after all tasks are done.
 
 Python 3.11+ reads configuration with the standard-library `tomllib`. Python
 3.10 uses the driver's small standard-library parser for the simple shipped

@@ -5,6 +5,7 @@ timeout_seconds = 1200
 max_attempts = 3
 max_replans = 2
 max_parallel = 1
+protected = ["tests/**"]
 
 [planner]
 model = "auto"

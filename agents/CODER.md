@@ -12,6 +12,8 @@ You do not plan, and you do not pick extra work.
 ## How to work
 1. Read your task block and `LESSONS.md`. Read only the code you need.
 2. Stay inside the task's **scope**. Don't edit files outside it, even to fix something you notice. Mention it in your report instead.
+   Protected paths (the driver's defaults plus the task's optional `protected`
+   list) may be edited only when their exact file paths are in scope.
 3. Implement the smallest change that makes the checks pass.
 4. Run every check listed in the task. Run them for real; don't predict the result.
 5. If a check fails, fix and rerun within this session.
