@@ -1,0 +1,20 @@
+[driver]
+integration_branch = "agent-integration"
+worktree_dir = ".worktrees"
+timeout_seconds = 1200
+max_attempts = 3
+max_parallel = 1
+
+[planner]
+model = "auto"
+command = ["copilot", "-p", "{prompt}", "--model", "{model}", "--allow-all-tools", "--deny-tool=shell(git push)", "--no-ask-user"]
+
+[coder]
+model = "auto"
+command = ["copilot", "-p", "{prompt}", "--model", "{model}", "--allow-all-tools", "--deny-tool=shell(git push)", "--no-ask-user"]
+
+# Claude Code examples:
+# command = ["claude", "-p", "{prompt}", "--model", "{model}", "--dangerously-skip-permissions"]
+#
+# OpenAI Codex examples:
+# command = ["codex", "exec", "--model", "{model}", "--full-auto", "{prompt}"]
