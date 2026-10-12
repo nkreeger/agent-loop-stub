@@ -71,6 +71,11 @@ the integration worktree. Green checks allow the merge commit; red checks
 abort the merge without changing integration history, so a later retry can
 merge normally. `final_checks` run after all tasks are done.
 
+After task checks and after each integration merge commit or abort, the driver
+restores the worktree using `git reset --hard HEAD` and `git clean -fd`.
+Ignored files are preserved. Integration must be clean before every merge;
+cleanup failures stop the run with an error.
+
 Python 3.11+ reads configuration with the standard-library `tomllib`. Python
 3.10 uses the driver's small standard-library parser for the simple shipped
 configuration shape.

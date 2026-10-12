@@ -523,6 +523,8 @@ class DriverIntegrationTests(unittest.TestCase):
         python = subprocess.list2cmdline([sys.executable])
         (self.root / "integration_gate.py").write_text(
             "import os\nfrom pathlib import Path\n"
+            "Path('coverage.out').write_text('check artifact')\n"
+            "Path('README.md').write_text('check changed tracked content')\n"
             "marker = Path(os.environ['FAKE_FINAL_MARKER'])\n"
             "if Path.cwd().name == 'integration' and not marker.exists():\n"
             "    marker.write_text('failed once')\n"
@@ -545,6 +547,108 @@ class DriverIntegrationTests(unittest.TestCase):
                 "log", "--merges", "--format=%H", "agent-integration"
             ).stdout.splitlines()),
         )
+        for name in ("A", "integration"):
+            worktree = self.worktree_root / name
+            self.assertFalse((worktree / "coverage.out").exists())
+            self.assertEqual("fixture\n", (worktree / "README.md").read_text())
+            self.assertEqual(
+                "",
+                subprocess.run(
+                    [self.git, "status", "--porcelain"],
+                    cwd=worktree,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout,
+            )
+
+    def test_check_artifact_failed_first_attempt_is_cleaned_before_retry(self) -> None:
+        python = subprocess.list2cmdline([sys.executable])
+        with (self.root / ".gitignore").open("a", encoding="utf-8") as handle:
+            handle.write("ignored-cache/\n")
+        (self.root / "artifact_check.py").write_text(
+            "from pathlib import Path\n"
+            "artifact = Path('coverage.out')\n"
+            "assert not artifact.exists(), 'artifact survived a previous attempt'\n"
+            "artifact.write_text('generated output')\n"
+            "Path('README.md').write_text('tracked check side effect')\n"
+            "Path('ignored-cache').mkdir(exist_ok=True)\n"
+            "Path('ignored-cache/cache.txt').write_text('keep ignored files')\n"
+            "raise SystemExit(Path('outputs/A.txt').read_text() == 'good-1')\n",
+            encoding="utf-8",
+        )
+        self.write_plan([task("A", checks=[f"{python} artifact_check.py"])])
+        self.commit_fixture()
+
+        self.run_driver("run")
+
+        current = self.plan_task("A")
+        self.assertEqual("done", current["status"])
+        self.assertEqual(1, current["attempts"])
+        self.assertEqual("check_failed", current["history"][0]["event"])
+        self.assertEqual("good-2", self.integration_file("outputs/A.txt"))
+        self.assertEqual("fixture\n", self.integration_file("README.md"))
+        for name in ("A", "integration"):
+            worktree = self.worktree_root / name
+            self.assertFalse((worktree / "coverage.out").exists())
+            self.assertTrue((worktree / "ignored-cache" / "cache.txt").exists())
+            self.assertEqual(
+                "",
+                subprocess.run(
+                    [self.git, "status", "--porcelain"],
+                    cwd=worktree,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout,
+            )
+
+    def test_dirty_integration_is_rejected_before_merge(self) -> None:
+        self.write_plan([])
+        self.commit_fixture()
+        (self.root / "coverage.out").write_text("unexpected leftover")
+        with mock.patch.object(driver, "git", wraps=driver.git) as commands:
+            with self.assertRaisesRegex(driver.DriverError, "not clean before merge"):
+                driver.merge_task(
+                    task("A"),
+                    {"branch": "task/A", "attempt": 1},
+                    self.git,
+                    self.root,
+                    30,
+                )
+        self.assertFalse(any(call.args[1][0] == "merge" for call in commands.call_args_list))
+        self.assertTrue((self.root / "coverage.out").exists())
+
+    def test_integration_cleanup_failure_reports_clear_error(self) -> None:
+        def fail_clean(executable, command, cwd, check=True):
+            return subprocess.CompletedProcess(
+                command, 1 if command == ["clean", "-fd"] else 0,
+                "Permission denied" if command == ["clean", "-fd"] else "",
+            )
+
+        with mock.patch.object(driver, "git", side_effect=fail_clean):
+            with self.assertRaisesRegex(
+                driver.DriverError,
+                r"cannot clean integration worktree.*git clean -fd failed",
+            ):
+                driver.clean_check_worktree(
+                    self.git, self.worktree_root / "integration", "integration"
+                )
+
+    def test_integration_cleanup_rejects_remaining_changes(self) -> None:
+        def dirty_status(executable, command, cwd, check=True):
+            return subprocess.CompletedProcess(
+                command, 0,
+                "?? coverage.out\n" if command == ["status", "--porcelain"] else "",
+            )
+
+        with mock.patch.object(driver, "git", side_effect=dirty_status):
+            with self.assertRaisesRegex(
+                driver.DriverError, "cannot clean integration worktree.*changes remain"
+            ):
+                driver.clean_check_worktree(
+                    self.git, self.worktree_root / "integration", "integration"
+                )
 
     def test_replanned_locked_task_loses_approval(self) -> None:
         approved = task("A", lane="locked", status="replan")

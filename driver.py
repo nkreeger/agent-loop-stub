@@ -902,6 +902,24 @@ def dirty_worktree(git_executable: str, worktree: Path) -> bool:
     return bool(git(git_executable, ["status", "--porcelain"], worktree).stdout.strip())
 
 
+def clean_check_worktree(
+    git_executable: str, worktree: Path, role: str
+) -> None:
+    for command in (["reset", "--hard", "HEAD"], ["clean", "-fd"]):
+        completed = git(git_executable, command, worktree, check=False)
+        if completed.returncode:
+            raise DriverError(
+                f"cannot clean {role} worktree {worktree}: "
+                f"git {' '.join(command)} failed:\n{completed.stdout.rstrip()}"
+            )
+    status = git(git_executable, ["status", "--porcelain"], worktree)
+    if status.stdout.strip():
+        raise DriverError(
+            f"cannot clean {role} worktree {worktree}; changes remain:\n"
+            f"{status.stdout.rstrip()}"
+        )
+
+
 def run_shell_check(command: str, cwd: Path, timeout: int) -> tuple[int, str]:
     creation_flags = (
         subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
@@ -1014,21 +1032,24 @@ def execute_task(
             },
         }
 
-    for check_command in task["checks"]:
-        check_code, check_output = run_shell_check(check_command, worktree, timeout)
-        if check_code:
-            return {
-                "id": task["id"],
-                "verdict": "red",
-                "failure": {
-                    "event": "check_failed",
-                    "attempt": attempt,
-                    "command": check_command,
-                    "exit_code": check_code,
-                    "evidence": tail(check_output),
-                    "log": str(log_path.relative_to(ROOT)),
-                },
-            }
+    try:
+        for check_command in task["checks"]:
+            check_code, check_output = run_shell_check(check_command, worktree, timeout)
+            if check_code:
+                return {
+                    "id": task["id"],
+                    "verdict": "red",
+                    "failure": {
+                        "event": "check_failed",
+                        "attempt": attempt,
+                        "command": check_command,
+                        "exit_code": check_code,
+                        "evidence": tail(check_output),
+                        "log": str(log_path.relative_to(ROOT)),
+                    },
+                }
+    finally:
+        clean_check_worktree(git_executable, worktree, "task")
     return {
         "id": task["id"],
         "verdict": "green",
@@ -1052,42 +1073,51 @@ def merge_task(
     integration_worktree: Path,
     timeout: int,
 ) -> dict[str, Any] | None:
-    completed = git(
-        git_executable,
-        ["merge", "--no-ff", "--no-commit", result["branch"]],
-        integration_worktree,
-        check=False,
-    )
-    if completed.returncode:
-        git(git_executable, ["merge", "--abort"], integration_worktree, check=False)
-        task["status"] = "conflict"
-        task["history"].append(
-            {
-                "event": "merge_conflict",
-                "attempt": result["attempt"],
-                "command": f"git merge --no-ff --no-commit {result['branch']}",
-                "exit_code": completed.returncode,
-                "evidence": tail(completed.stdout),
-                "at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            }
+    status = git(git_executable, ["status", "--porcelain"], integration_worktree)
+    if status.stdout.strip():
+        raise DriverError(
+            f"integration worktree {integration_worktree} is not clean before merge:\n"
+            f"{status.stdout.rstrip()}"
         )
-        return None
-    for check_command in task["checks"]:
-        check_code, check_output = run_shell_check(
-            check_command, integration_worktree, timeout
+    try:
+        completed = git(
+            git_executable,
+            ["merge", "--no-ff", "--no-commit", result["branch"]],
+            integration_worktree,
+            check=False,
         )
-        if check_code:
-            git(git_executable, ["merge", "--abort"], integration_worktree)
-            return {
-                "event": "integration_check_failed",
-                "attempt": result["attempt"],
-                "command": check_command,
-                "exit_code": check_code,
-                "evidence": tail(check_output),
-                "branch": result["branch"],
-            }
-    git(git_executable, ["commit", "--no-edit"], integration_worktree)
-    task["status"] = "done"
+        if completed.returncode:
+            git(git_executable, ["merge", "--abort"], integration_worktree, check=False)
+            task["status"] = "conflict"
+            task["history"].append(
+                {
+                    "event": "merge_conflict",
+                    "attempt": result["attempt"],
+                    "command": f"git merge --no-ff --no-commit {result['branch']}",
+                    "exit_code": completed.returncode,
+                    "evidence": tail(completed.stdout),
+                    "at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                }
+            )
+            return None
+        for check_command in task["checks"]:
+            check_code, check_output = run_shell_check(
+                check_command, integration_worktree, timeout
+            )
+            if check_code:
+                git(git_executable, ["merge", "--abort"], integration_worktree)
+                return {
+                    "event": "integration_check_failed",
+                    "attempt": result["attempt"],
+                    "command": check_command,
+                    "exit_code": check_code,
+                    "evidence": tail(check_output),
+                    "branch": result["branch"],
+                }
+        git(git_executable, ["commit", "--no-edit"], integration_worktree)
+        task["status"] = "done"
+    finally:
+        clean_check_worktree(git_executable, integration_worktree, "integration")
     return None
 
 
@@ -1148,7 +1178,16 @@ def dry_run(plan: dict[str, Any], config: dict[str, Any], max_parallel: int) -> 
             print(f"[{worktree}]$ scope-check against task base")
             for check_command in task["checks"]:
                 print(f"[{worktree}]$ {check_command}")
+            for cleanup_command in (
+                ["git", "reset", "--hard", "HEAD"],
+                ["git", "clean", "-fd"],
+                ["git", "status", "--porcelain"],
+            ):
+                print_command(cleanup_command, worktree)
             if task["lane"] == "contained":
+                print_command(
+                    ["git", "status", "--porcelain"], worktree_root / "integration"
+                )
                 print_command(
                     ["git", "merge", "--no-ff", "--no-commit", branch],
                     worktree_root / "integration",
@@ -1158,6 +1197,12 @@ def dry_run(plan: dict[str, Any], config: dict[str, Any], max_parallel: int) -> 
                 print_command(
                     ["git", "commit", "--no-edit"], worktree_root / "integration"
                 )
+                for cleanup_command in (
+                    ["git", "reset", "--hard", "HEAD"],
+                    ["git", "clean", "-fd"],
+                    ["git", "status", "--porcelain"],
+                ):
+                    print_command(cleanup_command, worktree_root / "integration")
                 task["status"] = "done"
             else:
                 print(f"{task['id']}: would mark needs_review and leave {branch} unmerged")
