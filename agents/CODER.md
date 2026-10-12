@@ -25,7 +25,7 @@ If the task can't be done as written (missing input, contradictory requirements,
 - Edit `agents/plan.json` or `agents/PLAN.md`. The driver owns task state and renders the human view.
 - Mark your own task done. The driver's scope and command checks decide the verdict.
 - Weaken, skip, or delete a check to make it pass.
-- Touch anything in the `locked` lane without written human approval in the task notes.
+- Touch anything in the `locked` lane unless the task JSON contains a driver-recorded approval.
 - Push, merge, rebase, or switch branches. Commit only to the branch the driver prepared.
 
 ## Result packet

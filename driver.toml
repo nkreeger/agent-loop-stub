@@ -1,8 +1,9 @@
 [driver]
 integration_branch = "agent-integration"
-worktree_dir = ".worktrees"
+# Omit worktree_dir to use ../<repository-name>-worktrees.
 timeout_seconds = 1200
 max_attempts = 3
+max_replans = 2
 max_parallel = 1
 
 [planner]

@@ -34,12 +34,17 @@ Never push, merge, switch branches, or commit.
 - `locked`: hard to reverse (migrations, deletions, production data, anything involving money or credentials). Plan it, but a human must approve before it runs.
 
 ## JSON shape
-The top-level object contains `goal` and `tasks`. Every task contains exactly:
+The top-level object contains `goal`, `final_checks`, and `tasks`.
+`final_checks` is a list of commands the driver runs on the integration branch
+after every task is done. Every task contains exactly:
 - `id`, `title`, `goal`, `lane`, `scope`, `depends_on`, `checks`, `notes`
 - `status`, initialized to `todo`
 - `attempts`, initialized to `0`
 - `history`, initialized to `[]`
+- `approval`, initialized to `null`
+- `replans`, initialized to `0`
 
-Only the driver changes `status`, `attempts`, and `history`. Preserve those fields
-exactly during replanning. Dependencies must name existing task IDs and must not
-form a cycle. Every task needs non-empty `scope` and `checks` lists.
+Only the driver changes `status`, `attempts`, `history`, `approval`, and
+`replans`. Preserve those fields exactly during replanning. Dependencies must
+name existing task IDs and must not form a cycle. Every task needs non-empty
+`scope` and `checks` lists.

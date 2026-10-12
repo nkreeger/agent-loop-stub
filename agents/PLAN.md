@@ -3,5 +3,8 @@
 
 **Goal:** Replace this sample plan by running: python3 driver.py plan "<goal>"
 
-| ID | Status | Lane | Attempts | Depends on | Title |
-|---|---|---|---:|---|---|
+**Final checks:**
+- none
+
+| ID | Status | Lane | Attempts | Replans | Depends on | Title |
+|---|---|---|---:|---:|---|---|
