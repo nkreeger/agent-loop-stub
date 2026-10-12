@@ -1,30 +1,81 @@
 # planner-coder
 
-A minimal two-role agent harness: a **planner** that decides what gets built, and **coders** that each build one task in a fresh context.
+A headless two-role agent harness: a **planner** writes a machine-readable plan,
+and fresh **coder** processes implement one task per git worktree. `driver.py`,
+not an agent, decides whether work passes.
 
 ## Layout
 
 ```
+driver.py       # standard-library coordinator (Python 3.10+)
+driver.toml     # planner/coder CLI adapters and runtime settings
 agents/
-  PLANNER.md   # planner prompt: writes and maintains PLAN.md, never writes product code
-  CODER.md     # coder prompt: does one task, stays in scope, returns a result packet
-  PLAN.md      # shared task board (template)
-  LESSONS.md   # rules learned from earlier runs (template)
+  PLANNER.md    # planner prompt: writes plan.json, never product code
+  CODER.md      # coder prompt: does one task and never edits plan state
+  plan.json     # source of truth
+  PLAN.md       # generated, read-only human view
+  LESSONS.md    # durable rules for future runs
 ```
 
-## How it runs
+## Usage
 
-1. Fill in the `{{...}}` placeholders in `agents/PLAN.md`, starting with the final checks.
-2. Run the planner once with `agents/PLANNER.md` and your goal. It fills in `PLAN.md`.
-3. For each `todo` task, start a **fresh** coder session with `agents/CODER.md` and the task ID.
-4. Give each coder's result packet back to the planner. The planner marks the task done, returns only the failed task, or rewrites a task after 3 failures.
+```console
+python3 driver.py plan "Add the requested feature"
+python3 driver.py status
+python3 driver.py approve T3 --by "Reviewer Name"
+python3 driver.py run --max-parallel 2
+python3 driver.py run --dry-run
+```
 
-Use a strong model for the planner and a cheaper, faster model for coders.
+The default adapter uses GitHub Copilot CLI prompt mode:
+`copilot -p ... --model ... --allow-all-tools --deny-tool=... --no-ask-user`.
+These flags were verified with `copilot --help`. Edit `driver.toml` to choose
+separate planner and coder models or command templates; commented examples show
+`claude -p` and `codex exec`.
 
-## Principles
+`run` creates `agent-integration` from the current `HEAD` if needed. Each task
+runs on `task/<id>` in its own directory under the configurable worktree root,
+which defaults to `../<repository-name>-worktrees`. The driver checks the
+actual git diff against the declared scope and runs every task check.
+Contained work is merged only into `agent-integration`; wide and approved
+locked work is left unmerged as `needs_review`. The driver never pushes.
 
-- Every task has checks that run as commands and pass or fail. "Looks good" is not a check.
-- Coders never mark their own work done. The planner (or a script) reruns the checks.
-- Add a dependency only when a task reads another task's output.
-- Lanes: `contained` can merge on green, `wide` needs a human glance, `locked` needs human approval.
-- Durable lessons go in `LESSONS.md`, so later runs start smarter.
+Failed commands and scope violations are recorded in `history`, including the
+last 40 output lines. A task returns to `todo` for a fresh coder process and
+becomes `replan` after three failures. Replanning waits for all in-flight work,
+then asks the planner to rewrite or split only failed tasks. Each task gets at
+most `max_replans` planner passes before becoming `blocked`.
+
+## Plan format
+
+`agents/plan.json` contains top-level `goal`, `final_checks`, and `tasks`. Every task has
+`id`, `title`, `goal`, `lane`, `scope`, `depends_on`, `checks`, `notes`,
+`status`, `attempts`, `history`, `approval`, and `replans`. The driver rejects
+unknown dependencies, cycles, empty checks, and empty scope. Only the driver
+changes state fields; `agents/PLAN.md` is regenerated after every state change.
+An optional per-task `protected` list supplements `[driver].protected`
+(default `["tests/**"]`). Protected files require exact paths in `scope`;
+scope globs or directory entries do not authorize changes to them.
+Replanning that changes any planner-owned task field revokes its approval.
+
+The in-memory plan is authoritative while a command runs. Agent calls are
+wrapped in checkout snapshots: unauthorized main/integration changes are
+restored and rejected, planner calls may change only `agents/plan.json`, and
+coder changes to plan state are RED. Each coder batch shares one pair of
+snapshots taken and verified on the main thread. Snapshots store recovery
+copies on disk, compare Git and file metadata first, and hash only candidate
+files. A batch with unauthorized changes is rejected before any merge.
+
+Contained tasks use `git merge --no-ff --no-commit`, then run their checks on
+the integration worktree. Green checks allow the merge commit; red checks
+abort the merge without changing integration history, so a later retry can
+merge normally. `final_checks` run after all tasks are done.
+
+After task checks and after each integration merge commit or abort, the driver
+restores the worktree using `git reset --hard HEAD` and `git clean -fd`.
+Ignored files are preserved. Integration must be clean before every merge;
+cleanup failures stop the run with an error.
+
+Python 3.11+ reads configuration with the standard-library `tomllib`. Python
+3.10 uses the driver's small standard-library parser for the simple shipped
+configuration shape.
