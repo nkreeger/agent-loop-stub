@@ -17,6 +17,3 @@ command = ["copilot", "-p", "{prompt}", "--model", "{model}", "--allow-all-tools
 
 # Claude Code examples:
 # command = ["claude", "-p", "{prompt}", "--model", "{model}", "--dangerously-skip-permissions"]
-#
-# OpenAI Codex examples:
-# command = ["codex", "exec", "--model", "{model}", "--full-auto", "{prompt}"]
