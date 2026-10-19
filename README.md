@@ -4,6 +4,13 @@ A headless two-role agent harness: a **planner** writes a machine-readable plan,
 and fresh **coder** processes implement one task per git worktree. `driver.py`,
 not an agent, decides whether work passes.
 
+For work spanning multiple hypotheses or long-lived services,
+[`graph_loop.py`](docs/graph-loop.md) adds a provider-neutral
+campaign → experiment → job → attempt lifecycle. It records immutable attempts,
+requires reconciliation before retrying uncertain work, and prevents completion
+until services have stop evidence. It composes with the planner/coder driver
+rather than replacing it.
+
 ## Layout
 
 ```
@@ -25,6 +32,8 @@ python3 driver.py status
 python3 driver.py approve T3 --by "Reviewer Name"
 python3 driver.py run --max-parallel 2
 python3 driver.py run --dry-run
+python3 -m unittest discover -s tests -q
+python3 scripts/check_public_content.py
 ```
 
 The default adapter uses GitHub Copilot CLI prompt mode:
