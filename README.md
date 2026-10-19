@@ -11,11 +11,34 @@ requires reconciliation before retrying uncertain work, and prevents completion
 until services have stop evidence. It composes with the planner/coder driver
 rather than replacing it.
 
+## Choose the right layer
+
+| Need | Use |
+|---|---|
+| Break one goal into scoped code changes and integrate passing work | `driver.py` |
+| Coordinate several hypotheses, tasks, or long-lived services | `graph_loop.py` |
+| Do both | Record a graph task attempt, run `driver.py`, then attach its checks and integration commit as evidence |
+
+The graph lifecycle is:
+
+```text
+campaign → experiment → task/service → immutable attempt
+```
+
+A campaign preserves intent while its experiment graph evolves. Each experiment
+tests one hypothesis. Tasks finish with evidence; services may unblock dependent
+work when ready but must have stop evidence before an experiment can finish.
+If an attempt's outcome becomes unknown, mark it uncertain and reconcile the
+original work before starting a retry.
+
 ## Layout
 
 ```
-driver.py       # standard-library coordinator (Python 3.10+)
-driver.toml     # planner/coder CLI adapters and runtime settings
+driver.py                   # planner/coder coordinator (Python 3.10+)
+driver.toml                 # planner/coder adapters and runtime settings
+graph_loop.py               # campaign/experiment/job lifecycle
+docs/graph-loop.md          # graph contract, recovery, and composition
+scripts/check_public_content.py
 agents/
   PLANNER.md    # planner prompt: writes plan.json, never product code
   CODER.md      # coder prompt: does one task and never edits plan state
@@ -35,6 +58,83 @@ python3 driver.py run --dry-run
 python3 -m unittest discover -s tests -q
 python3 scripts/check_public_content.py
 ```
+
+### Graph quick start
+
+```python
+from datetime import datetime, timezone
+from pathlib import Path
+
+from graph_loop import GraphStore
+
+graph = GraphStore(
+    Path(".agent-loop/graph.json"),
+    clock=lambda: datetime.now(timezone.utc).isoformat(),
+)
+graph.initialize()
+graph.create_campaign("release", "Ship a reviewed feature")
+graph.add_experiment(
+    "release",
+    "implementation",
+    "The implementation satisfies the request",
+    ["All required checks pass"],
+)
+graph.add_job(
+    "release",
+    "implementation",
+    "code",
+    kind="task",
+    depends_on=[],
+    acceptance=["The task driver reports green"],
+)
+graph.start_campaign("release")
+
+attempt = graph.start_attempt(
+    "release", "implementation", "code", {"plan_revision": "abc123"}
+)
+# Run a reviewed adapter such as driver.py, then record actual evidence.
+graph.finish_task(
+    "release",
+    "implementation",
+    "code",
+    attempt,
+    succeeded=True,
+    evidence=["checks passed at integration commit def456"],
+)
+graph.finish_experiment(
+    "release",
+    "implementation",
+    outcome="succeeded",
+    conclusion="The acceptance checks passed.",
+)
+graph.finish_campaign("release")
+```
+
+`GraphStore` atomically replaces its JSON state and records ordered events. It
+assumes one writer; add an external lock or transactional store when multiple
+coordinators may write the same graph. See
+[`docs/graph-loop.md`](docs/graph-loop.md) for service and interruption recovery
+examples.
+
+### Public-content safety
+
+The repository includes a generic scan for likely credentials, developer home
+paths, and non-public URLs:
+
+```console
+python3 scripts/check_public_content.py
+```
+
+Projects can add private vocabulary without committing or printing it. Keep a
+newline-delimited denylist outside the checkout and pass it at validation time:
+
+```console
+python3 scripts/check_public_content.py --deny-file /private/path/denylist.txt
+```
+
+The scanner reads the file but never copies its terms into the repository.
+Treat it as one review gate, not proof that arbitrary content is safe to
+publish.
 
 The default adapter uses GitHub Copilot CLI prompt mode:
 `copilot -p ... --model ... --allow-all-tools --deny-tool=... --no-ask-user`.
