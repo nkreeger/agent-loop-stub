@@ -82,6 +82,7 @@ class GraphStore:
             "intent": intent,
             "constraints": copy.deepcopy(constraints or {}),
             "status": "planning",
+            "services": {},
             "experiments": {},
             "created_at": self.clock(),
             "completed_at": None,
@@ -95,6 +96,8 @@ class GraphStore:
         experiment_id: str,
         hypothesis: str,
         acceptance: list[str],
+        *,
+        requires_services: list[str] | None = None,
     ) -> None:
         _identifier(experiment_id, "experiment id")
         if not isinstance(hypothesis, str) or not hypothesis.strip():
@@ -103,12 +106,22 @@ class GraphStore:
         state = self._load()
         campaign = self._campaign(state, campaign_id)
         self._require(campaign["status"], {"planning", "running"}, "add experiment")
+        required = list(requires_services or [])
+        if (
+            len(set(required)) != len(required)
+            or not all(isinstance(item, str) and IDENTIFIER.fullmatch(item) for item in required)
+        ):
+            raise GraphError("required services must be a unique list of IDs")
+        unknown = sorted(set(required) - set(campaign["services"]))
+        if unknown:
+            raise GraphError(f"unknown campaign services: {', '.join(unknown)}")
         if experiment_id in campaign["experiments"]:
             raise GraphError(f"experiment already exists: {experiment_id}")
         campaign["experiments"][experiment_id] = {
             "id": experiment_id,
             "hypothesis": hypothesis,
             "acceptance": list(acceptance),
+            "requires_services": required,
             "status": "pending",
             "jobs": {},
             "created_at": self.clock(),
@@ -117,6 +130,136 @@ class GraphStore:
         }
         self._event(
             state, campaign_id, experiment_id, None, "experiment_added", {}
+        )
+        self._save(state)
+
+    def add_experiment_bundle(
+        self,
+        campaign_id: str,
+        experiment_id: str,
+        hypothesis: str,
+        acceptance: list[str],
+        jobs: list[dict[str, Any]],
+        *,
+        requires_services: list[str] | None = None,
+        source_sha256: str | None = None,
+    ) -> None:
+        _identifier(experiment_id, "experiment id")
+        if not isinstance(hypothesis, str) or not hypothesis.strip():
+            raise GraphError("experiment hypothesis is required")
+        _nonempty_strings(acceptance, "experiment acceptance")
+        if not isinstance(jobs, list) or not jobs:
+            raise GraphError("experiment jobs must be a non-empty list")
+        required = list(requires_services or [])
+        if (
+            len(set(required)) != len(required)
+            or not all(
+                isinstance(item, str) and IDENTIFIER.fullmatch(item)
+                for item in required
+            )
+        ):
+            raise GraphError("required services must be a unique list of IDs")
+        if source_sha256 is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", source_sha256
+        ):
+            raise GraphError("source SHA-256 must be lowercase hexadecimal")
+
+        prepared_jobs: dict[str, dict[str, Any]] = {}
+        for job in jobs:
+            if not isinstance(job, dict) or set(job) != {
+                "id",
+                "kind",
+                "depends_on",
+                "acceptance",
+            }:
+                raise GraphError(
+                    "jobs require id, kind, depends_on, and acceptance"
+                )
+            job_id = job["id"]
+            _identifier(job_id, "job id")
+            if job_id in prepared_jobs:
+                raise GraphError(f"duplicate job id: {job_id}")
+            if job["kind"] not in {"task", "service"}:
+                raise GraphError("job kind must be task or service")
+            dependencies = job["depends_on"]
+            if (
+                not isinstance(dependencies, list)
+                or len(set(dependencies)) != len(dependencies)
+                or not all(
+                    isinstance(item, str) and IDENTIFIER.fullmatch(item)
+                    for item in dependencies
+                )
+            ):
+                raise GraphError("job dependencies must be a unique list of IDs")
+            unknown = sorted(set(dependencies) - set(prepared_jobs))
+            if unknown:
+                raise GraphError(f"unknown dependencies: {', '.join(unknown)}")
+            _nonempty_strings(job["acceptance"], "job acceptance")
+            prepared_jobs[job_id] = {
+                "id": job_id,
+                "kind": job["kind"],
+                "depends_on": list(dependencies),
+                "acceptance": list(job["acceptance"]),
+                "status": "pending",
+                "service_state": "stopped" if job["kind"] == "service" else None,
+                "attempts": [],
+            }
+
+        state = self._load()
+        campaign = self._campaign(state, campaign_id)
+        self._require(campaign["status"], {"planning", "running"}, "add experiment")
+        unknown_services = sorted(set(required) - set(campaign["services"]))
+        if unknown_services:
+            raise GraphError(
+                f"unknown campaign services: {', '.join(unknown_services)}"
+            )
+        if experiment_id in campaign["experiments"]:
+            raise GraphError(f"experiment already exists: {experiment_id}")
+        campaign["experiments"][experiment_id] = {
+            "id": experiment_id,
+            "hypothesis": hypothesis,
+            "acceptance": list(acceptance),
+            "requires_services": required,
+            "status": "pending",
+            "jobs": prepared_jobs,
+            "created_at": self.clock(),
+            "completed_at": None,
+            "conclusion": None,
+        }
+        detail = {"source_sha256": source_sha256} if source_sha256 else {}
+        self._event(
+            state, campaign_id, experiment_id, None, "experiment_added", detail
+        )
+        for job in prepared_jobs.values():
+            self._event(
+                state,
+                campaign_id,
+                experiment_id,
+                job["id"],
+                "job_added",
+                {"kind": job["kind"], "depends_on": job["depends_on"]},
+            )
+        self._save(state)
+
+    def add_campaign_service(
+        self, campaign_id: str, service_id: str, acceptance: list[str]
+    ) -> None:
+        _identifier(service_id, "service id")
+        _nonempty_strings(acceptance, "service acceptance")
+        state = self._load()
+        campaign = self._campaign(state, campaign_id)
+        self._require(campaign["status"], {"planning", "running"}, "add service")
+        if service_id in campaign["services"]:
+            raise GraphError(f"campaign service already exists: {service_id}")
+        campaign["services"][service_id] = {
+            "id": service_id,
+            "acceptance": list(acceptance),
+            "status": "pending",
+            "service_state": "stopped",
+            "attempts": [],
+        }
+        self._event(
+            state, campaign_id, None, service_id, "campaign_service_added", {}
         )
         self._save(state)
 
@@ -181,6 +324,182 @@ class GraphStore:
         self._event(state, campaign_id, None, None, "campaign_started", {})
         self._save(state)
 
+    def start_campaign_service(
+        self,
+        campaign_id: str,
+        service_id: str,
+        inputs: dict[str, Any],
+    ) -> str:
+        if not isinstance(inputs, dict):
+            raise GraphError("service inputs must be an object")
+        state = self._load()
+        campaign = self._campaign(state, campaign_id)
+        service = self._campaign_service(campaign, service_id)
+        self._require(campaign["status"], {"running"}, "start service")
+        self._require(service["status"], {"pending", "failed"}, "start service")
+        attempt_id = self.id_factory()
+        _identifier(attempt_id, "attempt id")
+        if any(
+            attempt_id == attempt["id"]
+            for candidate in campaign["services"].values()
+            for attempt in candidate["attempts"]
+        ):
+            raise GraphError(f"attempt id already exists: {attempt_id}")
+        attempt = {
+            "id": attempt_id,
+            "fingerprint": canonical_hash(
+                {
+                    "campaign": campaign_id,
+                    "service": service_id,
+                    "inputs": inputs,
+                }
+            ),
+            "inputs": copy.deepcopy(inputs),
+            "status": "running",
+            "evidence": [],
+            "started_at": self.clock(),
+            "completed_at": None,
+        }
+        service["attempts"].append(attempt)
+        service["status"] = "running"
+        service["service_state"] = "starting"
+        self._event(
+            state,
+            campaign_id,
+            None,
+            service_id,
+            "campaign_service_started",
+            {"attempt_id": attempt_id, "fingerprint": attempt["fingerprint"]},
+        )
+        self._save(state)
+        return attempt_id
+
+    def mark_campaign_service_ready(
+        self,
+        campaign_id: str,
+        service_id: str,
+        attempt_id: str,
+        *,
+        evidence: list[str],
+    ) -> None:
+        _nonempty_strings(evidence, "service readiness evidence")
+        state = self._load()
+        campaign = self._campaign(state, campaign_id)
+        service = self._campaign_service(campaign, service_id)
+        attempt = self._active_attempt(service, attempt_id)
+        self._require(service["service_state"], {"starting"}, "mark service ready")
+        service["service_state"] = "ready"
+        attempt["evidence"].extend(evidence)
+        self._event(
+            state,
+            campaign_id,
+            None,
+            service_id,
+            "campaign_service_ready",
+            {"attempt_id": attempt_id},
+        )
+        self._save(state)
+
+    def mark_campaign_service_uncertain(
+        self,
+        campaign_id: str,
+        service_id: str,
+        attempt_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        if not isinstance(reason, str) or not reason.strip():
+            raise GraphError("uncertain reason is required")
+        state = self._load()
+        campaign = self._campaign(state, campaign_id)
+        service = self._campaign_service(campaign, service_id)
+        attempt = self._active_attempt(service, attempt_id)
+        attempt["status"] = "uncertain"
+        service["status"] = "reconciling"
+        service["service_state"] = "unknown"
+        self._event(
+            state,
+            campaign_id,
+            None,
+            service_id,
+            "campaign_service_uncertain",
+            {"attempt_id": attempt_id, "reason": reason},
+        )
+        self._save(state)
+
+    def reconcile_campaign_service(
+        self,
+        campaign_id: str,
+        service_id: str,
+        attempt_id: str,
+        *,
+        outcome: str,
+        evidence: list[str],
+    ) -> None:
+        if outcome not in {"starting", "ready", "failed", "stopped"}:
+            raise GraphError(
+                "service reconciliation outcome must be starting, ready, failed, or stopped"
+            )
+        _nonempty_strings(evidence, "service reconciliation evidence")
+        state = self._load()
+        campaign = self._campaign(state, campaign_id)
+        service = self._campaign_service(campaign, service_id)
+        self._require(service["status"], {"reconciling"}, "reconcile service")
+        attempt = self._attempt(service, attempt_id)
+        self._require(attempt["status"], {"uncertain"}, "reconcile service")
+        attempt["evidence"].extend(evidence)
+        if outcome in {"starting", "ready"}:
+            attempt["status"] = "running"
+            service["status"] = "running"
+            service["service_state"] = outcome
+        else:
+            attempt["status"] = "failed" if outcome == "failed" else "succeeded"
+            attempt["completed_at"] = self.clock()
+            service["status"] = attempt["status"]
+            service["service_state"] = "unknown" if outcome == "failed" else "stopped"
+        self._event(
+            state,
+            campaign_id,
+            None,
+            service_id,
+            "campaign_service_reconciled",
+            {"attempt_id": attempt_id, "outcome": outcome},
+        )
+        self._save(state)
+
+    def stop_campaign_service(
+        self,
+        campaign_id: str,
+        service_id: str,
+        attempt_id: str,
+        *,
+        evidence: list[str],
+    ) -> None:
+        _nonempty_strings(evidence, "service stop evidence")
+        state = self._load()
+        campaign = self._campaign(state, campaign_id)
+        service = self._campaign_service(campaign, service_id)
+        attempt = self._active_attempt(service, attempt_id)
+        self._require(
+            service["service_state"], {"ready", "starting"}, "stop service"
+        )
+        service["service_state"] = "stopped"
+        service["status"] = "succeeded"
+        attempt.update(
+            status="succeeded",
+            evidence=attempt["evidence"] + list(evidence),
+            completed_at=self.clock(),
+        )
+        self._event(
+            state,
+            campaign_id,
+            None,
+            service_id,
+            "campaign_service_stopped",
+            {"attempt_id": attempt_id},
+        )
+        self._save(state)
+
     def ready_jobs(self, campaign_id: str, experiment_id: str) -> list[str]:
         state = self._load()
         campaign = self._campaign(state, campaign_id)
@@ -189,6 +508,8 @@ class GraphStore:
             "pending",
             "running",
         }:
+            return []
+        if not self._required_services_ready(campaign, experiment):
             return []
         return [
             job_id
@@ -215,6 +536,8 @@ class GraphStore:
         job = self._job(experiment, job_id)
         self._require(campaign["status"], {"running"}, "start attempt")
         self._require(experiment["status"], {"pending", "running"}, "start attempt")
+        if not self._required_services_ready(campaign, experiment):
+            raise GraphError("required campaign services are not ready")
         if job_id not in self._ready_job_ids(experiment):
             raise GraphError(f"job is not ready: {job_id}")
         attempt_id = self.id_factory()
@@ -478,10 +801,39 @@ class GraphStore:
         ]
         if unresolved:
             raise GraphError(f"campaign has unresolved experiments: {', '.join(unresolved)}")
+        active_services = [
+            service["id"]
+            for service in campaign["services"].values()
+            if service["service_state"] != "stopped"
+        ]
+        if active_services:
+            raise GraphError(
+                f"campaign has active services: {', '.join(active_services)}"
+            )
         campaign["status"] = "completed"
         campaign["completed_at"] = self.clock()
         self._event(state, campaign_id, None, None, "campaign_finished", {})
         self._save(state)
+
+    def record_checkpoint(
+        self, campaign_id: str, note: str, *, slide_ready: bool = False
+    ) -> int:
+        if not isinstance(note, str) or not note.strip():
+            raise GraphError("checkpoint note is required")
+        state = self._load()
+        campaign = self._campaign(state, campaign_id)
+        self._require(campaign["status"], {"running"}, "record checkpoint")
+        self._event(
+            state,
+            campaign_id,
+            None,
+            None,
+            "slide_checkpoint" if slide_ready else "progress_checkpoint",
+            {"note": note},
+        )
+        sequence = state["events"][-1]["sequence"]
+        self._save(state)
+        return sequence
 
     def _ready_job_ids(self, experiment: dict[str, Any]) -> set[str]:
         return {
@@ -493,6 +845,16 @@ class GraphStore:
                 for dependency in job["depends_on"]
             )
         }
+
+    @staticmethod
+    def _required_services_ready(
+        campaign: dict[str, Any], experiment: dict[str, Any]
+    ) -> bool:
+        return all(
+            campaign["services"][service_id]["status"] == "running"
+            and campaign["services"][service_id]["service_state"] == "ready"
+            for service_id in experiment["requires_services"]
+        )
 
     @staticmethod
     def _dependency_ready(job: dict[str, Any]) -> bool:
@@ -524,6 +886,15 @@ class GraphStore:
             return campaign["experiments"][experiment_id]
         except KeyError as exc:
             raise GraphError(f"unknown experiment: {experiment_id}") from exc
+
+    @staticmethod
+    def _campaign_service(
+        campaign: dict[str, Any], service_id: str
+    ) -> dict[str, Any]:
+        try:
+            return campaign["services"][service_id]
+        except KeyError as exc:
+            raise GraphError(f"unknown campaign service: {service_id}") from exc
 
     @staticmethod
     def _job(experiment: dict[str, Any], job_id: str) -> dict[str, Any]:

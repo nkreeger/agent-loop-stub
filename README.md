@@ -1,4 +1,4 @@
-# Agent Loop Stub
+# Agent Loop Toolkit
 
 A standard-library toolkit for building provider-neutral agent graphs and
 durable execution loops.
@@ -30,6 +30,8 @@ campaign → experiment → task/service → immutable attempt
 - A **task** is finite work that finishes with evidence.
 - A **service** may unblock dependent work when ready, but remains unresolved
   until it has stop evidence.
+- A **campaign service** can remain ready across multiple experiments. A smoke
+  test records readiness; it does not imply teardown.
 - An **attempt** pins its inputs and fingerprint. Retrying creates a new attempt
   instead of rewriting history.
 
@@ -140,6 +142,96 @@ graph.finish_campaign("release")
 assumes one writer. Add an external lock or transactional store when multiple
 coordinators may write the same graph.
 
+### External campaign runtime
+
+[`campaign_runtime.py`](campaign_runtime.py) and [`loopctl.py`](loopctl.py)
+keep mutable campaign state outside source repositories. The default location
+is:
+
+```text
+${XDG_STATE_HOME:-~/.local/state}/agent-loop-toolkit/<project>/<campaign>/
+```
+
+Each campaign has an atomic `graph.json`, append-only `events.jsonl`,
+single-writer `owner.lock`, immutable definition copy, and adapter
+request/response receipts. Set `AGENT_LOOP_STATE_HOME` or pass
+`--state-root` to choose another private state root.
+
+Initialize a checked-in project definition:
+
+```console
+python3 loopctl.py init \
+  --project example \
+  --definition /path/to/project/campaigns/example/campaign.json
+
+python3 loopctl.py service start \
+  --project example --campaign example --service retained-environment
+
+python3 loopctl.py service reconcile \
+  --project example --campaign example --service retained-environment
+
+python3 loopctl.py status --project example --campaign example
+```
+
+Queue a follow-up experiment without rewriting the checked-in campaign
+definition or prior attempts:
+
+```console
+python3 loopctl.py experiment add \
+  --project example --campaign example \
+  --file /path/to/follow-up.json
+
+python3 loopctl.py status \
+  --project example --campaign example --json
+
+python3 loopctl.py checkpoint \
+  --project example --campaign example \
+  --note "Follow-up queued after reviewing the retained evidence" \
+  --slides
+```
+
+Follow-up files use the same `id`, `hypothesis`, `acceptance`,
+`requires_services`, and `jobs` shape as entries in the initial definition.
+The runtime copies each accepted file into private state, records its canonical
+hash in the append-only event stream, and adds the experiment and jobs in one
+atomic graph update.
+
+External executors can bind work to immutable attempts:
+
+```console
+ATTEMPT=$(python3 loopctl.py task start \
+  --project example --campaign example \
+  --experiment follow-up --job probe \
+  --inputs '{"revision":"abc123"}')
+
+python3 loopctl.py task uncertain \
+  --project example --campaign example \
+  --experiment follow-up --job probe \
+  --attempt "$ATTEMPT" --reason "coordinator interrupted"
+
+python3 loopctl.py task reconcile \
+  --project example --campaign example \
+  --experiment follow-up --job probe \
+  --attempt "$ATTEMPT" --outcome failed \
+  --evidence "the original worker is absent"
+```
+
+An uncertain attempt blocks replacement work until reconciliation. Status JSON
+includes the complete constraints, retained services, jobs, attempts, evidence,
+queue counts, next progress deadline, and next slide-ready status deadline.
+Checkpoints are immutable JSON snapshots under the campaign's private state
+directory.
+
+`watch` prints status at the definition's configured interval and timezone.
+Service adapters inherit the terminal so authentication remains visible to
+the human. They exchange immutable request and response files through
+`AGENT_LOOP_REQUEST` and `AGENT_LOOP_RESPONSE`; a lost or invalid response
+makes the attempt uncertain and requires reconciliation before retry.
+
+The runtime does not provision anything by itself. A project-owned adapter
+implements authentication, allocation, readiness and final cleanup through
+the owning platform interface.
+
 ## Compose the layers
 
 The graph layer does not execute commands, and the task driver does not own a
@@ -239,6 +331,8 @@ publish.
 
 ```text
 graph_loop.py                   campaign/experiment/job lifecycle
+campaign_runtime.py             external state, retained services, adapters
+loopctl.py                       campaign runtime CLI
 driver.py                       planner/coder worktree executor
 driver.toml                     executor adapters and runtime settings
 docs/graph-loop.md              graph contract, recovery, and composition
@@ -251,6 +345,7 @@ agents/
   PLAN.md                       generated human-readable plan
 tests/
   test_graph_loop.py            graph lifecycle and recovery tests
+  test_campaign_runtime.py      external state and retained-service tests
   test_driver.py                task execution and integration tests
 ```
 

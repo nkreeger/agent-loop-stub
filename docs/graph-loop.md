@@ -9,6 +9,8 @@ the existing worktree and scope enforcement.
 ```text
 campaign
   intent + constraints
+  ├── retained service
+  │     immutable attempts + ready/reconcile/stop lifecycle
   └── experiment
         hypothesis + acceptance + conclusion
         └── job
@@ -24,6 +26,9 @@ campaign
 - A **task** is a finite unit of work.
 - A **service** may unblock dependent work when ready, but remains unresolved
   until it has stop evidence.
+- A **campaign service** represents an environment shared by multiple
+  experiments. It remains ready after an experiment concludes and blocks
+  campaign completion until explicit stop evidence is recorded.
 - An **attempt** is immutable history. A retry creates another attempt rather
   than rewriting the failed or interrupted one.
 
@@ -51,6 +56,29 @@ permits multiple coordinators must add an external lock or transactional store.
 The module intentionally does not choose an agent provider, provision resources,
 execute commands, authorize credentials, or publish changes. Callers own those
 policy and adapter decisions.
+
+`CampaignRuntime` supplies the local single-writer lock, external state
+directory, append-only event journal, terminal-preserving adapter protocol and
+timezone-aware status loop. It does not weaken the graph's reconciliation
+rules.
+
+## Retained environment flow
+
+```text
+authenticate
+  -> create one original resource
+  -> starting
+  -> ready
+  -> experiment A
+  -> experiment B
+  -> explicit stop
+  -> campaign completion
+```
+
+Experiment completion never stops a campaign service. If create, status or
+stop loses its result, the service becomes `reconciling`; a replacement
+attempt cannot begin until the original identity is observed and recorded as
+starting, ready, failed or stopped.
 
 ## Example
 

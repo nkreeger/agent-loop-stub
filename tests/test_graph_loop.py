@@ -153,6 +153,116 @@ class GraphLoopTests(unittest.TestCase):
         self.store.finish_campaign("C1")
         self.assertEqual("completed", self.store.snapshot()["campaigns"]["C1"]["status"])
 
+    def test_campaign_service_is_retained_across_experiments(self) -> None:
+        self.store.add_campaign_service(
+            "C1",
+            "environment",
+            ["The assigned environment is ready and remains owned"],
+        )
+        for experiment in ("E2", "E3"):
+            self.store.add_experiment(
+                "C1",
+                experiment,
+                "The retained environment supports another experiment",
+                ["The request passes"],
+                requires_services=["environment"],
+            )
+            self.store.add_job(
+                "C1",
+                experiment,
+                "smoke",
+                kind="task",
+                depends_on=[],
+                acceptance=["A request succeeds"],
+            )
+        self.add_task("bootstrap")
+        self.store.start_campaign("C1")
+
+        bootstrap = self.store.start_attempt(
+            "C1", "E1", "bootstrap", {"phase": "local"}
+        )
+        self.store.finish_task(
+            "C1",
+            "E1",
+            "bootstrap",
+            bootstrap,
+            succeeded=True,
+            evidence=["local preparation passed"],
+        )
+        self.store.finish_experiment(
+            "C1", "E1", outcome="succeeded", conclusion="Prepared"
+        )
+        self.assertEqual([], self.store.ready_jobs("C1", "E2"))
+        service_attempt = self.store.start_campaign_service(
+            "C1", "environment", {"allocation": "owned-allocation"}
+        )
+        self.store.mark_campaign_service_ready(
+            "C1",
+            "environment",
+            service_attempt,
+            evidence=["environment identity is ready"],
+        )
+
+        for experiment in ("E2", "E3"):
+            self.assertEqual(["smoke"], self.store.ready_jobs("C1", experiment))
+            attempt = self.store.start_attempt(
+                "C1", experiment, "smoke", {"request": experiment}
+            )
+            self.store.finish_task(
+                "C1",
+                experiment,
+                "smoke",
+                attempt,
+                succeeded=True,
+                evidence=["request passed"],
+            )
+            self.store.finish_experiment(
+                "C1",
+                experiment,
+                outcome="succeeded",
+                conclusion="Validated on the retained environment",
+            )
+
+        with self.assertRaisesRegex(GraphError, "active services: environment"):
+            self.store.finish_campaign("C1")
+        self.store.stop_campaign_service(
+            "C1",
+            "environment",
+            service_attempt,
+            evidence=["original environment is absent"],
+        )
+        self.store.finish_campaign("C1")
+
+    def test_uncertain_campaign_service_must_be_reconciled(self) -> None:
+        self.store.add_campaign_service(
+            "C1", "environment", ["The environment is ready"]
+        )
+        self.add_task("A")
+        self.store.start_campaign("C1")
+        attempt = self.store.start_campaign_service(
+            "C1", "environment", {"allocation": "owned-allocation"}
+        )
+        self.store.mark_campaign_service_uncertain(
+            "C1",
+            "environment",
+            attempt,
+            reason="coordinator stopped during create",
+        )
+
+        with self.assertRaisesRegex(GraphError, "reconciling"):
+            self.store.start_campaign_service(
+                "C1", "environment", {"allocation": "replacement"}
+            )
+        self.store.reconcile_campaign_service(
+            "C1",
+            "environment",
+            attempt,
+            outcome="ready",
+            evidence=["the original environment identity is ready"],
+        )
+        service = self.store.snapshot()["campaigns"]["C1"]["services"]["environment"]
+        self.assertEqual("ready", service["service_state"])
+
     def test_campaign_cannot_finish_with_unresolved_experiment(self) -> None:
         self.add_task("A")
         self.store.start_campaign("C1")
@@ -180,6 +290,61 @@ class GraphLoopTests(unittest.TestCase):
         events = reloaded.snapshot()["events"]
         self.assertEqual(list(range(1, len(events) + 1)), [e["sequence"] for e in events])
         self.assertEqual("attempt_finished", events[-1]["kind"])
+
+    def test_running_campaign_adds_experiment_bundle_atomically(self) -> None:
+        self.add_task("A")
+        self.store.start_campaign("C1")
+        before = self.store.snapshot()
+
+        with self.assertRaisesRegex(GraphError, "unknown dependencies"):
+            self.store.add_experiment_bundle(
+                "C1",
+                "E2",
+                "A follow-up tests the retained finding",
+                ["Both jobs pass"],
+                [
+                    {
+                        "id": "second",
+                        "kind": "task",
+                        "depends_on": ["missing"],
+                        "acceptance": ["Evidence is recorded"],
+                    }
+                ],
+            )
+        self.assertEqual(before, self.store.snapshot())
+
+        self.store.add_experiment_bundle(
+            "C1",
+            "E2",
+            "A follow-up tests the retained finding",
+            ["Both jobs pass"],
+            [
+                {
+                    "id": "first",
+                    "kind": "task",
+                    "depends_on": [],
+                    "acceptance": ["First evidence is recorded"],
+                },
+                {
+                    "id": "second",
+                    "kind": "task",
+                    "depends_on": ["first"],
+                    "acceptance": ["Second evidence is recorded"],
+                },
+            ],
+            source_sha256="a" * 64,
+        )
+        state = self.store.snapshot()
+        self.assertEqual(["first"], self.store.ready_jobs("C1", "E2"))
+        self.assertEqual(
+            "a" * 64,
+            next(
+                event["detail"]["source_sha256"]
+                for event in state["events"]
+                if event["kind"] == "experiment_added"
+                and event["experiment_id"] == "E2"
+            ),
+        )
 
 
 if __name__ == "__main__":
